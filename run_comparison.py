@@ -26,7 +26,8 @@ import numpy as np
 
 from robots import make_orbita, make_srs
 from singularity import (CHEST_ROI, SIGMA_THRESHOLD, chest_grid,
-                         compare_singularity, evaluate_grid)
+                         compare_common_poses, compare_singularity,
+                         evaluate_grid)
 from workspace import compare_workspace, measure_workspace
 
 OUT_DIR = "outputs"
@@ -197,6 +198,11 @@ def main():
     sg_sphere = [evaluate_grid(r, rng, args.threshold, args.n_orient, mode="sphere")
                  for r in robots]
     print(compare_singularity(sg_sphere))
+    print()
+    # (c) apples-to-apples: per-pose sigma_min on the SAME poses, incl. the
+    #     intersection both arms can reach (removes the selection bias).
+    print(compare_common_poses(robots, rng, args.threshold, args.n_orient,
+                               mode="task"))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     _plot_workspace(ws_results, os.path.join(OUT_DIR, "workspace_compare.png"))

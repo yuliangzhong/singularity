@@ -260,3 +260,78 @@ def compare_singularity(results: list[GridResult]) -> str:
     row("5th pctile worst-case sigma_min", lambda r: np.nanpercentile(r.worst_smin, 5))
     lines.append("=" * 78)
     return "\n".join(lines)
+
+
+def _per_pose_smin(robot: Robot, pos_all: np.ndarray, R_all: np.ndarray,
+                   rng: np.random.Generator, restarts: int = 6,
+                   batch: int = 8000):
+    """Best-conditioned sigma_min for every (position x orientation) pose.
+
+    Returns (reached, smin), both shape (M,); smin is -1 where unreachable.
+    No per-position 'worst orientation' aggregation -- one value per pose.
+    """
+    M = pos_all.shape[0]
+    best = np.full(M, -1.0)
+    reached = np.zeros(M, dtype=bool)
+    for _ in range(restarts):
+        q0 = robot.sample_joints(M, rng)
+        q, rc, _, _ = robot.ik_pose_batch(pos_all, R_all, q0)
+        _, _, J = robot.fk_jacobian(q)
+        sm = singular_values(J)[:, -1]
+        take = rc & (sm > best)
+        best[take] = sm[take]
+        reached |= rc
+    return reached, best
+
+
+def compare_common_poses(robots: list, rng: np.random.Generator,
+                         threshold: float = SIGMA_THRESHOLD,
+                         n_orient: int = N_ORIENT,
+                         mode: str = "task") -> str:
+    """Apples-to-apples: compare the arms on the SAME benchmark poses.
+
+    Evaluates per-pose sigma_min (no 'worst per position' aggregation) and
+    reports statistics over (a) each arm's own reachable poses and (b) the
+    intersection of poses BOTH arms can reach.  This removes the selection
+    bias that flatters the arm which reaches fewer (easier) poses.
+    """
+    grid = chest_grid()
+    if mode == "task":
+        dirs = _cone_directions(n_orient, APPROACH_DIR, APPROACH_CONE)
+    else:
+        dirs = _fibonacci_directions(n_orient)
+    Ro = _rot_x_to(dirs)
+    pos_all = np.repeat(grid, n_orient, axis=0)
+    R_all = np.tile(Ro, (len(grid), 1, 1))
+
+    res = [(_per_pose_smin(r, pos_all, R_all, rng)) for r in robots]
+    reached = [x[0] for x in res]
+    smin = [x[1] for x in res]
+    both = reached[0] & reached[1]
+
+    lines = []
+    lines.append("=" * 78)
+    lines.append("METRIC 2b -- PER-POSE sigma_min, APPLES-TO-APPLES "
+                 f"({mode} orientations)")
+    lines.append(f"total benchmark poses = {len(pos_all):,}   "
+                 f"threshold sigma_min < {threshold:.3f}")
+    lines.append("=" * 78)
+    hdr = f"{'metric':<40}" + "".join(f"{r.name.split()[0]:>18}" for r in robots)
+    lines.append(hdr)
+    lines.append("-" * 78)
+
+    def row(label, vals, fmt="{:>18.4f}"):
+        lines.append(f"{label:<40}" + "".join(fmt.format(v) for v in vals))
+
+    row("reachable poses [count]", [int(m.sum()) for m in reached], fmt="{:>18d}")
+    lines.append(f"{'poses BOTH arms reach [count]':<40}{both.sum():>18d}")
+    lines.append("-- over EACH arm's OWN reachable poses " + "-" * 39)
+    row("median sigma_min", [np.median(smin[i][reached[i]]) for i in range(2)])
+    row("near-singular [%]",
+        [100 * np.mean(smin[i][reached[i]] < threshold) for i in range(2)])
+    lines.append("-- over the COMMON poses both arms reach " + "-" * 37)
+    row("median sigma_min", [np.median(smin[i][both]) for i in range(2)])
+    row("near-singular [%]",
+        [100 * np.mean(smin[i][both] < threshold) for i in range(2)])
+    lines.append("=" * 78)
+    return "\n".join(lines)
