@@ -21,9 +21,11 @@ Architecture 1 -- "SRS" (Spherical - Revolute - Spherical)
 Architecture 2 -- "Orbita" (Reachy 2, Pollen Robotics)
     DOF grouping: shoulder Orbita2d [2] + elbow Orbita2d [2]
                   + wrist Orbita3d [3]                    ->  2-2-3
-    The Orbita actuators are modelled as *unlimited* rotation joints
-    (continuous rotation capability), i.e. the full [-pi, pi] range is
-    always available and never removed by a mechanical stop.
+    Joint travel is taken from the official Pollen Reachy 2 URDF and
+    cross-checked with the ByteDance ByteWrist paper (arXiv:2509.18084):
+    the shoulder/elbow are finite revolute pairs and the parallel Orbita3d
+    wrist tilts inside a CONE (half-angle ~45 deg) with a free roll about the
+    arm axis -- NOT three independent unlimited axes.  See make_orbita.
 
 Both arms share identical link lengths so the workspaces are directly
 comparable, and both are mounted at the same shoulder location with the
@@ -114,6 +116,12 @@ class Robot:
     segment_idx: list[int]      # joint indices for shoulder/elbow/wrist markers
     base: np.ndarray = field(default_factory=_base_transform)
     unlimited: np.ndarray = field(default=None)  # (n,) bool, informational
+    # Orbita-style parallel wrist: the two tilt DOFs (cone_idx) can only tilt
+    # the wrist axis inside a cone of half-angle cone_angle, i.e.
+    # sqrt(q[i]^2 + q[j]^2) <= cone_angle.  The wrist roll about the arm axis
+    # stays free.  See make_orbita for sources (Reachy URDF, ByteWrist paper).
+    cone_idx: tuple = None       # (i, j) joint indices forming the tilt cone
+    cone_angle: float = 0.0      # cone half-angle [rad]
 
     @property
     def n(self) -> int:
@@ -124,8 +132,37 @@ class Robot:
         """Total shoulder->tip length L (used to normalise workspace volume)."""
         return float(TIP[0])
 
+    def _project_limits(self, q: np.ndarray) -> np.ndarray:
+        """Clamp box limits, wrap unlimited joints, project the wrist cone.
+
+        Works for a single config (n,) or a batch (M, n).
+        """
+        unlimited = self.unlimited if self.unlimited is not None \
+            else np.zeros(self.n, bool)
+        q = np.where(unlimited,
+                     (q + np.pi) % (2 * np.pi) - np.pi,
+                     np.clip(q, self.lower, self.upper))
+        if self.cone_idx is not None and self.cone_angle > 0:
+            i, j = self.cone_idx
+            qi = q[..., i]
+            qj = q[..., j]
+            r = np.hypot(qi, qj)
+            scale = np.where(r > self.cone_angle,
+                             self.cone_angle / np.maximum(r, 1e-9), 1.0)
+            q[..., i] = qi * scale
+            q[..., j] = qj * scale
+        return q
+
     def sample_joints(self, n_samples: int, rng: np.random.Generator) -> np.ndarray:
-        return rng.uniform(self.lower, self.upper, size=(n_samples, self.n))
+        q = rng.uniform(self.lower, self.upper, size=(n_samples, self.n))
+        if self.cone_idx is not None and self.cone_angle > 0:
+            # sample the two tilt DOFs uniformly inside the cone disk
+            i, j = self.cone_idx
+            r = self.cone_angle * np.sqrt(rng.uniform(0, 1, n_samples))
+            phi = rng.uniform(0, 2 * np.pi, n_samples)
+            q[:, i] = r * np.cos(phi)
+            q[:, j] = r * np.sin(phi)
+        return q
 
     # -- forward kinematics + geometric Jacobian, fully vectorised --------
     def fk_jacobian(self, q: np.ndarray):
@@ -192,8 +229,6 @@ class Robot:
         q = np.zeros(self.n) if q0 is None else np.array(q0, dtype=float)
         target = np.asarray(target, dtype=float)
         I3 = np.eye(3)
-        unlimited = self.unlimited if self.unlimited is not None \
-            else np.zeros(self.n, bool)
         err = np.inf
         for _ in range(iters):
             tip, _, J = self.fk_jacobian(q[None])
@@ -206,10 +241,7 @@ class Robot:
             step = float(np.linalg.norm(dq))
             if step > 0.5:                            # cap the step for stability
                 dq *= 0.5 / step
-            q = q + dq
-            q = np.where(unlimited,
-                         (q + np.pi) % (2 * np.pi) - np.pi,
-                         np.clip(q, self.lower, self.upper))
+            q = self._project_limits(q + dq)
         return q, err < tol * 3, err
 
     # -- batched full 6-DOF pose IK (for task-space sampling) -------------
@@ -234,8 +266,6 @@ class Robot:
         q = np.array(q0, dtype=float)
         M = q.shape[0]
         I6 = np.eye(6)
-        unlimited = self.unlimited if self.unlimited is not None \
-            else np.zeros(self.n, bool)
         pos_err = np.full(M, np.inf)
         rot_err = np.full(M, np.inf)
 
@@ -257,10 +287,7 @@ class Robot:
 
             step = np.linalg.norm(dq, axis=1, keepdims=True)
             scale = np.where(step > 0.5, 0.5 / np.maximum(step, 1e-9), 1.0)
-            q = q + dq * scale
-            q = np.where(unlimited,
-                         (q + np.pi) % (2 * np.pi) - np.pi,
-                         np.clip(q, self.lower, self.upper))
+            q = self._project_limits(q + dq * scale)
 
         reached = (pos_err < pos_tol) & (rot_err < rot_tol)
         return q, reached, pos_err, rot_err
@@ -284,8 +311,6 @@ class Robot:
         """
         q = np.array(q0, dtype=float)
         I3 = np.eye(3)
-        unlimited = self.unlimited if self.unlimited is not None \
-            else np.zeros(self.n, bool)
         pos_err = np.full(q.shape[0], np.inf)
 
         for _ in range(iters):
@@ -298,10 +323,7 @@ class Robot:
             dq = (Jv.transpose(0, 2, 1) @ y)[:, :, 0]      # (M, n)
             step = np.linalg.norm(dq, axis=1, keepdims=True)
             scale = np.where(step > 0.5, 0.5 / np.maximum(step, 1e-9), 1.0)
-            q = q + dq * scale
-            q = np.where(unlimited,
-                         (q + np.pi) % (2 * np.pi) - np.pi,
-                         np.clip(q, self.lower, self.upper))
+            q = self._project_limits(q + dq * scale)
 
         reached = pos_err < tol
         return q, reached, pos_err
@@ -387,11 +409,27 @@ def make_srs() -> Robot:
 
 
 def make_orbita() -> Robot:
-    """Reachy 2 Orbita arm, 2-2-3 grouping, unlimited-travel joints.
+    """Reachy 2 Orbita arm, 2-2-3 grouping, with REAL joint limits.
 
     Shoulder and elbow are compact Orbita2d actuators (2 intersecting axes
     each); the wrist is a compact Orbita3d spherical actuator.  A short wrist
     module separates the wrist centre from the tool tip.
+
+    Joint travel is taken from the official Pollen Reachy 2 URDF
+    (reachy2_symbolic_ik/config_files/reachy2.urdf) and cross-checked against
+    the ByteDance ByteWrist paper (arXiv:2509.18084), which reports the same
+    parallel-wrist architecture with a conical motion range:
+
+      * shoulder  : two DOF, ~+/-90 deg travel each
+      * elbow     : yaw +/-90 deg, pitch -129..+5.7 deg (anthropomorphic,
+                    bends one way only)                 [URDF -2.25..0.1 rad]
+      * wrist     : Orbita3d spherical actuator.  The two TILT DOF are NOT
+                    two independent +/-180 axes -- they are limited to a CONE.
+                    Reachy casts the wrist into a cone of half-angle 42.5 deg
+                    (limit_orbita3d, orbita3D_max_angle = radians(42.5)); the
+                    ByteWrist paper gives beta^2 + gamma^2 < 0.72 rad^2
+                    (half-angle ~48.6 deg).  We use 45 deg, between the two.
+                    The wrist roll about the arm axis stays free (multi-turn).
     """
     x_sh = 0.0
     x_elb = D_SHOULDER + L_UPPER
@@ -399,23 +437,31 @@ def make_orbita() -> Robot:
 
     omegas = np.array([
         _Y, _Z,         # shoulder Orbita2d: pitch, yaw
-        _Y, _Z,         # elbow    Orbita2d: pitch, yaw
-        _X, _Y, _Z,     # wrist    Orbita3d: roll (unlimited), pitch, yaw
+        _Y, _Z,         # elbow    Orbita2d: yaw, pitch
+        _X, _Y, _Z,     # wrist    Orbita3d: roll (free), tilt-pitch, tilt-yaw
     ])
     points = np.array([
         [x_sh, 0, 0], [x_sh, 0, 0],
         [x_elb, 0, 0], [x_elb, 0, 0],
         [x_wri, 0, 0], [x_wri, 0, 0], [x_wri, 0, 0],
     ], dtype=float)
-    upper = _deg(180, 180, 180, 180, 180, 180, 180)
-    lower = -upper
+
+    #                shoulder      elbow        wrist
+    #                pit   yaw     yaw   pit     roll  tiltY tiltZ
+    upper = _deg(90,   90,     90,   5.7,    180,  45,   45)
+    lower = _deg(-90, -90,    -90, -129.0,  -180, -45,  -45)
+
+    unlimited = np.array([0, 0, 0, 0, 1, 0, 0], dtype=bool)  # only wrist roll
     return Robot(
-        name="Orbita (2-2-3, unlimited)",
+        name="Orbita (2-2-3, real+cone)",
         omegas=omegas, points=points,
         lower=lower, upper=upper,
         segment_idx=[0, 2, 4],
-        unlimited=np.ones(7, dtype=bool),
+        unlimited=unlimited,
+        cone_idx=(5, 6),                 # wrist tilt-pitch / tilt-yaw
+        cone_angle=np.deg2rad(45.0),     # half-cone (Reachy 42.5, ByteWrist 48.6)
     )
+
 
 
 def manipulability(J: np.ndarray) -> np.ndarray:

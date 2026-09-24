@@ -13,13 +13,32 @@ grouping**, **realistic serial link lengths**, and the **joint travel limits**.
 | | grouping | joints | limits |
 |---|---|---|---|
 | **SRS** (KUKA iiwa-like) | Spherical–Revolute–Spherical, `3-1-3` | 7 serial revolute | **real KUKA iiwa** travel (±170/120/170/120/170/120/175°) |
-| **Orbita** (Reachy 2) | Orbita2d + Orbita2d + Orbita3d, `2-2-3` | 7 | **unlimited** rotation |
+| **Orbita** (Reachy 2) | Orbita2d + Orbita2d + Orbita3d, `2-2-3` | 7 | **real Reachy 2 limits + parallel-wrist cone** |
 
 Both arms are given the **same total reach L** and realistic proportions
 (shoulder module 0.05, upper arm 0.28, forearm 0.25, wrist module 0.06,
 tool 0.07 m — every sub-joint separated by a short non-zero link), mounted at
 the same shoulder with the Reachy-2 shoulder orientation (−15° roll, +10° yaw)
 so the workspace sits in front of the chest.
+
+### Orbita joint limits — sources
+
+The Orbita limits are taken from the **official Pollen Reachy 2 URDF**
+(`reachy2_symbolic_ik/config_files/reachy2.urdf`) and cross-checked against the
+**ByteDance ByteWrist paper** (arXiv:2509.18084), whose ByteMini robot uses the
+same 7-DoF SRS arm with a 3-DoF parallel wrist:
+
+- shoulder: two DOF, ≈ ±90° each
+- elbow: yaw ±90°, pitch **−129° … +5.7°** (anthropomorphic, bends one way)
+- wrist (Orbita3d): the two **tilt** DOF are **not** two free ±180° axes — they
+  are confined to a **cone**. Reachy casts the wrist into a cone of half-angle
+  **42.5°** (`limit_orbita3d`, `orbita3D_max_angle = radians(42.5)`); ByteWrist
+  gives `β² + γ² < 0.72 rad²` (half-angle **≈ 48.6°**). We use **45°**, between
+  the two. The wrist **roll** about the arm axis stays free (multi-turn).
+
+The cone is enforced everywhere: joint sampling draws the two tilt DOF uniformly
+inside the disk of radius 45°, and every IK iteration projects the wrist tilt
+back onto the cone (`Robot._project_limits`).
 
 ## Metric 1 — reachable workspace size
 
@@ -34,8 +53,10 @@ normalised by the arm length cubed **V / L³** (dimensionless).
 
 1. Down-sample the chest workspace on a **3-D equidistant grid** of target
    positions (`CHEST_ROI`, `GRID_STEP`).
-2. Attach **N maximum-span orientations** to every grid position — approach
-   directions spread as widely as possible over the sphere (Fibonacci lattice).
+2. Attach **N required orientations** to every grid position. Two orientation
+   sets are supported (`evaluate_grid(mode=...)`): a **task approach-cone**
+   (±90° about a forward-and-down direction — the fair everyday set) and a
+   **full-sphere** Fibonacci spread (the harsh stress test).
    Positions × orientations = the benchmark pose set ("指标集").
 3. Solve full 6-DOF, **7-axis IK** for every benchmark pose. The arm is
    redundant, so a redundancy-aware planner uses the 7th DOF to steer *away*
@@ -92,58 +113,112 @@ python visualizer.py --step 0.03     # finer grid (smoother, larger file)
 
 | | SRS | Orbita |
 |---|---|---|
-| normalised V / L³ | **4.06** | 3.89 |
-| relative | 100 % | 95.8 % |
+| normalised V / L³ | **4.06** | 2.87 |
+| relative | 100 % | 70.8 % |
 
-The positional workspaces are almost identical (SRS marginally larger). The
-unlimited wrist does **not** buy a bigger *positional* workspace — tip position
-is set mainly by the shoulder + elbow, which both architectures span similarly.
+With the **real** Reachy 2 limits (and the ±45° parallel-wrist cone), the Orbita
+arm reaches a **noticeably smaller** positional workspace — about **71 %** of the
+SRS arm. So the answer to Q1 is **no — Orbita does not reach a larger workspace**.
 
-**Metric 2 — chest singularity** (grid 50 mm, 16 orientations/point):
+Decomposing the cause (position volume is set by shoulder + elbow, the wrist only
+adds a small tool-length shell):
+
+| Orbita variant | V / L³ | of SRS |
+|---|---|---|
+| real limits + 45° wrist cone | 2.75 | 71 % |
+| real limits, wrist ±45° box (no cone) | 2.78 | 72 % |
+| real shoulder/elbow, wrist widened to ±120° | 2.83 | 73 % |
+
+So the **wrist cone is *not* the cause** of the workspace shrinkage — widening the
+wrist to ±120° only recovers ~2 points. The envelope is dominated by the real
+**shoulder ±90°** and the **one-way elbow bend** (−129°…+5.7°).
+
+**Metric 2 — chest singularity.** Each grid position must serve a set of tool
+orientations; we report the **worst** orientation per position (7-DOF IK,
+best-conditioned solution). Two orientation sets are evaluated with the same code
+([singularity.py](singularity.py), `evaluate_grid(mode=...)`):
+
+- **Task approach-cone** (*fair, everyday*): orientations only inside a ±90°
+  cone about a **forward-and-down** approach direction — the tool just has to
+  point into the work area, which is all a chest-front manipulation task needs.
+- **Full-sphere** (*harsh stress test*): orientations spread over the whole
+  sphere, including tool-up / tool-back poses no chest task requires.
+
+**(a) Task approach-cone — the fair everyday benchmark** (grid 50 mm, 16 orient/pt):
 
 | | SRS | Orbita |
 |---|---|---|
-| reachable positions | 96.1 % | **100 %** |
-| mean orientation reachability | 75.6 % | **96.1 %** |
-| near-singular positions (worst orientation) | **2.4 %** | 12.4 % |
-| mean worst-case σ_min | **0.082** | 0.070 |
-| median worst-case σ_min | **0.081** | 0.076 |
+| reachable positions | **92.2 %** | 49.1 % |
+| mean orientation reachability | **75.5 %** | 15.8 % |
+| near-singular positions (worst orientation) | 1.3 % | **0.0 %** |
+| mean worst-case σ_min | 0.086 | **0.111** |
+| median worst-case σ_min | 0.085 | **0.112** |
 
-The honest, nuanced answer:
+**(b) Full-sphere — the harsh stress test** (grid 50 mm, 16 orient/pt):
 
-- **Orbita wins big on orientation dexterity** — it reaches essentially every
-  chest position and ~96 % of all required orientations, versus 76 % for the
-  limited SRS wrist. This is exactly what the continuous-rotation Orbita
-  actuators buy.
-- **But Orbita has MORE near-singular positions in the worst case.** Because it
-  can reach many hard orientations that the SRS wrist simply cannot, some of
-  those newly-reachable orientations sit near the Orbita3d wrist's *intrinsic*
-  gimbal singularities. The SRS is never "penalised" for those orientations —
-  it just can't reach them, so they are excluded from its worst case.
+| | SRS | Orbita |
+|---|---|---|
+| reachable positions | **95.8 %** | 58.8 % |
+| mean orientation reachability | **76.1 %** | 12.6 % |
+| near-singular positions (worst orientation) | 2.1 % | **0.1 %** |
+| mean worst-case σ_min | 0.079 | **0.119** |
+| median worst-case σ_min | 0.078 | **0.120** |
 
-So Reachy 2's advantage is **reachability / dexterity**, not a larger workspace
-and not fewer singularities: the unlimited wrist trades a few intrinsic
-worst-case singular spots for a large gain in achievable orientations.
+The honest, nuanced answer (holds in **both** benchmarks):
+
+- The parallel wrist is **far more restricted in orientation**. Even on the fair
+  ±90° approach-cone benchmark it serves only ~**16 %** of the required
+  orientations (vs ~76 % for the serial SRS wrist) and reaches ~**49 %** of chest
+  positions with *any* required orientation. A ±90° half-cone is a whole
+  hemisphere, and a ±45° wrist cone still cannot cover it — so restricting the
+  benchmark from full-sphere to a hemisphere barely helps Orbita.
+- **But within the poses it can reach, Orbita stays markedly clearer of
+  singularity**: its worst-case σ_min distribution is shifted well to the right
+  (median ≈ 0.11 vs 0.08) and **~0 %** of positions are near-singular, vs 1–2 %
+  for the SRS arm.
+
+The low orientation figure is **physically consistent**, not a bug: a 45°
+half-cone covers only `2π(1−cos45°) ≈ 14.6 %` of the sphere, so a cone wrist
+cannot reach broadly spread orientations no matter the benchmark.
+
+This matches the ByteWrist paper's thesis: the parallel wrist trades **orientation
+range / workspace** for **compactness, stiffness and clean, singularity-free
+motion** in the poses it does reach — which is exactly what makes it strong in
+confined, chest-front dual-arm tasks even though its raw reachability is lower.
+
+> **Caveat.** The worst-case σ_min per position is taken over each arm's *own*
+> reachable orientations. Because Orbita reaches far fewer orientations, its
+> "worst case" is over a smaller (easier) set, which flatters its near-singular
+> fraction. The two metrics must therefore be read **together**: Orbita is
+> cleaner *but* over a much smaller reachable set.
 
 ## Files
 
 - [robots.py](robots.py) — kinematics (FK, geometric Jacobian, position IK, batched 6-DOF pose IK) and the two robot definitions.
 - [workspace.py](workspace.py) — Metric 1: dense joint-space sampling → V / L³.
-- [singularity.py](singularity.py) — Metric 2: chest grid × max-span orientations → 7-DOF IK worst-case singularity.
+- [singularity.py](singularity.py) — Metric 2: chest grid × orientations (task approach-cone or full-sphere) → 7-DOF IK worst-case singularity.
 - [run_comparison.py](run_comparison.py) — runs both metrics, prints tables, saves figures and the interactive HTML.
 - [visualizer.py](visualizer.py) — builds the interactive browser viewer (pre-computed IK, Plotly.js; no matplotlib, never freezes).
 
 ## Assumptions & simplifications
 
-- Both arms share the same reach L and realistic proportions; SRS uses the real
-  KUKA iiwa joint limits, Orbita is unlimited (full `[-π, π]`, no stops).
-- The Orbita2d/3d actuators are modelled as ideal serial revolute clusters (the
-  internal parallel mechanism is ignored, as requested).
+- Both arms share the same reach L and realistic proportions. SRS uses the real
+  KUKA iiwa joint limits; Orbita uses the real Reachy 2 URDF limits plus a ±45°
+  parallel-wrist cone (Reachy 42.5° / ByteWrist 48.6°) with a free wrist roll.
+- The Orbita2d/3d actuators are modelled as ideal serial revolute clusters with
+  the correct travel/cone limits; the internal parallel linkage geometry itself
+  is not simulated (only its motion range).
 - Redundancy is credited: for each pose the best-conditioned 7-DOF IK solution
   found across restarts is used (a redundancy-aware planner avoiding
   singularities). The same rule is applied to both arms.
 - Worst-case σ_min per position is taken over each arm's **own reachable**
   orientations, so the near-singular fraction must be read together with the
-  orientation-reachability figure.
+  orientation-reachability figure (see caveat above).
 - Volume is a voxel-occupancy estimate; the normalised V / L³ ratio is the
   robust comparison, not the absolute m³.
+
+## Sources
+
+- Pollen Robotics — Reachy 2 URDF, `reachy2_symbolic_ik/config_files/reachy2.urdf` (joint limits, `limit_orbita3d` 42.5° wrist cone).
+- Pollen Robotics — Reachy 2 hardware specification (shoulder −15° roll / +10° yaw, 2×Orbita2d + Orbita3d arm).
+- J. Tian et al., "ByteWrist: A Parallel Robotic Wrist Enabling Flexible and Anthropomorphic Motion for Confined Spaces," ByteDance Seed, arXiv:2509.18084 (7-DoF SRS arm, parallel wrist cone `β²+γ² < 0.72`, vs serial Kinova).

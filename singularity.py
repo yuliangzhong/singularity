@@ -45,6 +45,13 @@ GRID_STEP = 0.05        # equidistant grid spacing [m]
 N_ORIENT = 12           # max-span orientations per grid position
 IK_RESTARTS = 6         # redundancy restarts, keep best-conditioned
 
+# Task-oriented orientation set: instead of demanding orientations spread over
+# the WHOLE sphere (which structurally penalises any cone-limited wrist), a
+# fairer "everyday manipulation" benchmark only requires the tool to point
+# roughly into the work area -- forward and slightly down -- within a cone.
+APPROACH_DIR = np.array([1.0, 0.0, -1.0])   # forward (+X) and down (-Z)
+APPROACH_CONE = np.deg2rad(90.0)            # half-angle of the required cone
+
 
 @dataclass
 class GridResult:
@@ -56,6 +63,7 @@ class GridResult:
     n_grid_total: int         # grid positions tested (incl. unreachable)
     n_orient: int
     threshold: float
+    mode: str = "sphere"      # "sphere" (full-sphere) or "task" (approach cone)
 
     @property
     def pos_reach_fraction(self) -> float:
@@ -86,6 +94,37 @@ def _fibonacci_directions(n: int) -> np.ndarray:
     return np.stack([np.sin(phi) * np.cos(theta),
                      np.sin(phi) * np.sin(theta),
                      np.cos(phi)], axis=1)
+
+
+def _cone_directions(n: int, axis: np.ndarray, half_angle: float) -> np.ndarray:
+    """N unit vectors evenly spread inside a cone of `half_angle` about `axis`.
+
+    Uses a Fibonacci cap so the directions are as uniform as possible over the
+    spherical cap (the set of "acceptable" tool approach directions).
+    """
+    axis = axis / np.linalg.norm(axis)
+    cos_h = np.cos(half_angle)
+    i = np.arange(n) + 0.5
+    # cos(polar) uniformly in [cos_h, 1] -> uniform area over the cap
+    cz = 1.0 - (i / n) * (1.0 - cos_h)          # local z (about +Z)
+    r = np.sqrt(np.clip(1.0 - cz * cz, 0.0, None))
+    gold = np.pi * (1.0 + 5.0 ** 0.5)
+    theta = gold * i
+    local = np.stack([r * np.cos(theta), r * np.sin(theta), cz], axis=1)
+    # rotate local +Z onto `axis`
+    z = np.array([0.0, 0.0, 1.0])
+    c = float(z @ axis)
+    if c > 1 - 1e-8:
+        return local
+    if c < -1 + 1e-8:
+        local[:, 2] *= -1
+        return local
+    v = np.cross(z, axis)
+    s = np.linalg.norm(v)
+    v /= s
+    K = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]])
+    R = np.eye(3) + s * K + (1 - c) * (K @ K)
+    return local @ R.T
 
 
 def _rot_x_to(d: np.ndarray) -> np.ndarray:
@@ -138,11 +177,22 @@ def evaluate_grid(robot: Robot, rng: np.random.Generator,
                   threshold: float = SIGMA_THRESHOLD,
                   n_orient: int = N_ORIENT,
                   restarts: int = IK_RESTARTS,
+                  mode: str = "sphere",
                   batch: int = 6000) -> GridResult:
-    """Chest-grid worst-case singularity evaluation for one arm."""
+    """Chest-grid worst-case singularity evaluation for one arm.
+
+    mode = "sphere" : required orientations spread over the WHOLE sphere
+                      (harsh stress test; penalises cone-limited wrists).
+    mode = "task"   : required orientations only inside an APPROACH_CONE about
+                      APPROACH_DIR (forward+down) -- a fair everyday-manipulation
+                      benchmark where the tool just points into the work area.
+    """
     grid = chest_grid()                          # (G0, 3)
     G0 = grid.shape[0]
-    dirs = _fibonacci_directions(n_orient)
+    if mode == "task":
+        dirs = _cone_directions(n_orient, APPROACH_DIR, APPROACH_CONE)
+    else:
+        dirs = _fibonacci_directions(n_orient)
     R_orient = _rot_x_to(dirs)                    # (N, 3, 3)
 
     # flatten all (grid position x orientation) benchmark poses
@@ -176,14 +226,18 @@ def evaluate_grid(robot: Robot, rng: np.random.Generator,
     return GridResult(
         name=robot.name, points=points, worst_smin=worst_smin,
         orient_reach=orient_reach_sel, near_mask=near_mask,
-        n_grid_total=G0, n_orient=n_orient, threshold=threshold,
+        n_grid_total=G0, n_orient=n_orient, threshold=threshold, mode=mode,
     )
 
 
 def compare_singularity(results: list[GridResult]) -> str:
     lines = []
+    mode = results[0].mode
+    title = ("FULL-SPHERE orientations (stress test)" if mode == "sphere"
+             else f"TASK APPROACH-CONE orientations "
+                  f"(+/-{int(np.degrees(APPROACH_CONE))} deg, everyday)")
     lines.append("=" * 78)
-    lines.append("METRIC 2 -- CHEST-WORKSPACE SINGULARITY (grid x max-span orientations)")
+    lines.append(f"METRIC 2 -- CHEST-WORKSPACE SINGULARITY -- {title}")
     lines.append(f"grid step = {GRID_STEP * 1000:.0f} mm   "
                  f"orientations/point = {results[0].n_orient}   "
                  f"threshold sigma_min < {results[0].threshold:.3f}")

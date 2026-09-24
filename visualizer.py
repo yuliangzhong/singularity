@@ -192,7 +192,7 @@ _HTML_TEMPLATE = r"""<!DOCTYPE html>
   .ok{color:#2ca02c}
 </style></head>
 <body>
-<h2>SRS (3-1-3, limited) vs Reachy 2 Orbita (2-2-3, unlimited) &mdash; chest workspace</h2>
+<h2>SRS (3-1-3, limited) vs Reachy 2 Orbita (2-2-3, real+cone) &mdash; chest workspace</h2>
 <div id="plots">
   <div id="p0" class="plot"></div>
   <div id="p1" class="plot"></div>

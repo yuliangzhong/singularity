@@ -91,8 +91,10 @@ def _plot_singularity(sg_results, threshold, path):
 
     os.makedirs(OUT_DIR, exist_ok=True)
     fig = plt.figure(figsize=(15, 6))
+    mode_txt = ("task approach-cone" if sg_results[0].mode == "task"
+                else "full-sphere")
     fig.suptitle("Metric 2 — chest-workspace worst-case singularity "
-                 f"(grid × max-span orientations, σ_min < {threshold:.3f})",
+                 f"({mode_txt} orientations, σ_min < {threshold:.3f})",
                  fontsize=13)
     allpts = chest_grid()
     vmax = max(np.nanpercentile(r.worst_smin, 95) for r in sg_results)
@@ -186,15 +188,21 @@ def main():
     print()
 
     # ---- Metric 2: chest singularity ----
-    sg_results = [evaluate_grid(r, rng, args.threshold, args.n_orient)
-                  for r in robots]
-    print(compare_singularity(sg_results))
+    # (a) fair everyday benchmark: tool only needs to point into the work area
+    sg_task = [evaluate_grid(r, rng, args.threshold, args.n_orient, mode="task")
+               for r in robots]
+    print(compare_singularity(sg_task))
+    print()
+    # (b) harsh stress test: orientations spread over the whole sphere
+    sg_sphere = [evaluate_grid(r, rng, args.threshold, args.n_orient, mode="sphere")
+                 for r in robots]
+    print(compare_singularity(sg_sphere))
 
     os.makedirs(OUT_DIR, exist_ok=True)
     _plot_workspace(ws_results, os.path.join(OUT_DIR, "workspace_compare.png"))
-    _plot_singularity(sg_results, args.threshold,
+    _plot_singularity(sg_task, args.threshold,
                       os.path.join(OUT_DIR, "singularity_compare.png"))
-    _plot_interactive(sg_results, args.threshold,
+    _plot_interactive(sg_task, args.threshold,
                       os.path.join(OUT_DIR, "singularity_interactive.html"))
 
     if not args.no_show:
